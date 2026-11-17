@@ -14,11 +14,39 @@ pub fn facts(models_dir: &Path) -> Value {
         let get = |k: &str| b.lines().find(|l| l.starts_with(k)).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string());
         Some((get("physical id")?, get("core id")?))
     }).collect();
+    #[allow(unused_mut)]
+    let mut cpu_name = field("model name");
+    #[allow(unused_mut)]
+    let mut core_count = (!cores.is_empty()).then_some(cores.len());
+    #[cfg(windows)]
+    {
+        if cpu_name.is_none() {
+            cpu_name = crate::monitor::win_cpu_name();
+        }
+        if core_count.is_none() {
+            core_count = crate::monitor::win_physical_cores();
+        }
+    }
     let flags = field("flags").unwrap_or_default();
     let has = |f: &str| flags.split_whitespace().any(|x| x == f);
-    let simd: Vec<&str> = ["avx2", "fma", "avx512f", "avx512_bf16", "avx512_vnni", "amx_tile", "amx_bf16"].into_iter().filter(|f| has(f)).collect();
+    #[allow(unused_mut)]
+    let mut simd: Vec<&str> = ["avx2", "fma", "avx512f", "avx512_bf16", "avx512_vnni", "amx_tile", "amx_bf16"].into_iter().filter(|f| has(f)).collect();
+    #[cfg(target_arch = "x86_64")]
+    if simd.is_empty() {
+        for (ok, name) in [
+            (std::arch::is_x86_feature_detected!("avx2"), "avx2"),
+            (std::arch::is_x86_feature_detected!("fma"), "fma"),
+            (std::arch::is_x86_feature_detected!("avx512f"), "avx512f"),
+            (std::arch::is_x86_feature_detected!("avx512bf16"), "avx512_bf16"),
+            (std::arch::is_x86_feature_detected!("avx512vnni"), "avx512_vnni"),
+        ] {
+            if ok {
+                simd.push(name);
+            }
+        }
+    }
     json!({
-        "cpu": {"name": field("model name"), "cores": (!cores.is_empty()).then_some(cores.len()),
+        "cpu": {"name": cpu_name, "cores": core_count,
                 "threads": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), "simd": simd},
         "ram_gb": (crate::mem::total_gb() * 10.0).round() / 10.0,
         "gpus": gpus(),
@@ -30,7 +58,14 @@ pub fn facts(models_dir: &Path) -> Value {
 /// OCuLink shows a narrow link, which bounds expert streaming).
 fn gpus() -> Value {
     let q = "index,name,memory.total,pci.bus_id,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.gpucurrent,pcie.link.width.current";
-    let Ok(o) = std::process::Command::new("nvidia-smi").args([&format!("--query-gpu={q}"), "--format=csv,noheader,nounits"]).output() else {
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args([&format!("--query-gpu={q}"), "--format=csv,noheader,nounits"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let Ok(o) = cmd.output() else {
         return json!([]);
     };
     parse_gpus(&String::from_utf8_lossy(&o.stdout))

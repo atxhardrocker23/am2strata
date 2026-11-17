@@ -67,13 +67,20 @@ pub struct Media {
     catalog: std::sync::Mutex<Option<Value>>,
 }
 
-/// The media engine: $AM2STRATA_MEDIA_EXE, else crates/strata-media's release build beside this binary's checkout.
+/// The media engine: $AM2STRATA_MEDIA_EXE, beside this binary, else crates/strata-media's release build beside this binary's checkout.
 pub fn find_exe() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("AM2STRATA_MEDIA_EXE").map(PathBuf::from) {
         return p.is_file().then_some(p);
     }
     let exe = std::env::current_exe().ok()?;
-    exe.ancestors().skip(1).take(5).map(|d| d.join("crates/strata-media/target/release/am2strata-media")).find(|p| p.is_file())
+    let bin_name = if cfg!(windows) { "am2strata-media.exe" } else { "am2strata-media" };
+    if let Some(parent) = exe.parent() {
+        let sibling = parent.join(bin_name);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+    exe.ancestors().skip(1).take(5).map(|d| d.join("crates/strata-media/target/release").join(bin_name)).find(|p| p.is_file())
 }
 
 impl Media {

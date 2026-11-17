@@ -825,6 +825,52 @@ impl Round for LocalRound {
     }
 }
 
+/// Resolve common model-invented aliases or unambiguous unprefixed MCP tool names to an offered tool name.
+fn resolve_tool_alias(
+    name: &str,
+    offered: &std::collections::HashSet<String>,
+    hub: Option<&crate::mcp::McpHub>,
+) -> Option<String> {
+    if offered.contains(name) {
+        return None;
+    }
+    if matches!(name, "web_fetch" | "fetch") && offered.contains("fetch_url") {
+        return Some("fetch_url".to_string());
+    }
+    if name == "search" && offered.contains("web_search") {
+        return Some("web_search".to_string());
+    }
+    if let Some(h) = hub {
+        let mut matches = h
+            .routes()
+            .into_iter()
+            .filter(|(prefixed, _, tool)| {
+                offered.contains(prefixed) && tool["name"].as_str() == Some(name)
+            })
+            .map(|(prefixed, _, _)| prefixed);
+        if let (Some(first), None) = (matches.next(), matches.next()) {
+            return Some(first);
+        }
+    }
+    None
+}
+
+/// True if the client explicitly declared a tool with `name` in `req["tools"]`.
+fn client_owns_tool(req: &Value, name: &str) -> bool {
+    req.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools.iter().any(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| t.get("name").and_then(Value::as_str))
+                    == Some(name)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// The tool loop over `gen`'s rounds, from its first round's answer `first` (start_mcp).
 #[allow(clippy::too_many_arguments)]
 pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: Prepared, req: Value, opts: RunOpts,
@@ -851,10 +897,34 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                         mcp_ids.insert(id.clone());
                         RunEvent::Mcp(json!({"event": "start", "id": id, "name": name}))
                     }
+                    RunEvent::Event(Event::ToolStart { id, name }) => {
+                        if let Some(resolved) = resolve_tool_alias(&name, &names, hub.as_deref()) {
+                            mcp_ids.insert(id.clone());
+                            RunEvent::Mcp(json!({"event": "start", "id": id, "name": resolved}))
+                        } else if !client_owns_tool(&req, &name) {
+                            mcp_ids.insert(id.clone());
+                            RunEvent::Mcp(json!({"event": "start", "id": id, "name": name}))
+                        } else {
+                            RunEvent::Event(Event::ToolStart { id, name })
+                        }
+                    }
                     RunEvent::Event(Event::ToolArgs { id, .. }) if mcp_ids.contains(&id) => continue,
                     RunEvent::Event(Event::ToolCall(c)) if names.contains(&c.name) => {
                         calls.push(c);
                         continue;
+                    }
+                    RunEvent::Event(Event::ToolCall(mut c)) => {
+                        if let Some(resolved) = resolve_tool_alias(&c.name, &names, hub.as_deref()) {
+                            c.name = resolved;
+                            calls.push(c);
+                            continue;
+                        } else if !client_owns_tool(&req, &c.name) {
+                            calls.push(c);
+                            continue;
+                        } else {
+                            own += 1;
+                            RunEvent::Event(Event::ToolCall(c))
+                        }
                     }
                     RunEvent::Done(s) => {
                         done = Some(s);
@@ -1114,7 +1184,7 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                         r = e.call(&args, &original_request) => r,
                         _ = tx.closed() => return,
                     }
-                } else if let Some(h) = &hub {
+                } else if let (true, Some(h)) = (names.contains(&c.name), &hub) {
                     tokio::select! {
                         r = h.call(&c.name, &args) => r,
                         _ = tx.closed() => return,
@@ -1258,5 +1328,52 @@ mod compact_tests {
         // a conversation that fits is left alone
         let mut small = vec![json!({"role": "tool", "content": "short"})];
         assert_eq!(compact_tool_results(&mut small, 16_000), 0);
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::{client_owns_tool, resolve_tool_alias};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn aliases_web_fetch_and_search_when_offered() {
+        let offered: HashSet<String> = ["fetch_url", "web_search"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            resolve_tool_alias("web_fetch", &offered, None).as_deref(),
+            Some("fetch_url")
+        );
+        assert_eq!(
+            resolve_tool_alias("fetch", &offered, None).as_deref(),
+            Some("fetch_url")
+        );
+        assert_eq!(
+            resolve_tool_alias("search", &offered, None).as_deref(),
+            Some("web_search")
+        );
+        // Exact match returns None (already handled)
+        assert_eq!(resolve_tool_alias("fetch_url", &offered, None), None);
+        // Unknown returns None
+        assert_eq!(resolve_tool_alias("nonexistent_tool", &offered, None), None);
+    }
+
+    #[test]
+    fn client_owns_tool_checks_openai_and_flat_shapes() {
+        let empty = json!({"model": "x"});
+        assert!(!client_owns_tool(&empty, "web_fetch"));
+
+        let with_tools = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "my_client_fn", "parameters": {}}},
+                {"name": "flat_tool"}
+            ]
+        });
+        assert!(client_owns_tool(&with_tools, "my_client_fn"));
+        assert!(client_owns_tool(&with_tools, "flat_tool"));
+        assert!(!client_owns_tool(&with_tools, "web_fetch"));
     }
 }

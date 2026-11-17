@@ -18,6 +18,9 @@ const PAGE_BYTES: usize = 4 << 20;
 /// How long a backend that was blocked or failed is left alone before it is tried again.
 const SKIP_FOR: Duration = Duration::from_secs(600); // ten minutes
 
+/// Browser-compatible User-Agent used for web searches so endpoints don't treat am2Strata as a blocked bot.
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+
 /// The built-in order of the search backends; `"web_search.backends"` in the run config overrides it.
 const BACKENDS: [&str; 5] = ["searxng", "duckduckgo", "duckduckgo_lite", "brave", "wikipedia"];
 
@@ -138,9 +141,21 @@ impl WebTools {
     }
 
     fn client() -> Result<reqwest::Client, String> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+            ),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
         reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) am2Strata")
-            .timeout(Duration::from_secs(20))
+            .user_agent(BROWSER_UA)
+            .default_headers(headers)
+            .timeout(Duration::from_secs(8))
             .build()
             .map_err(|e| e.to_string())
     }
@@ -178,15 +193,45 @@ impl WebTools {
     async fn try_backend(&self, name: &str, q: &str, n: usize) -> Result<Vec<Hit>, String> {
         match name {
             "searxng" => self.searxng_search(q, n).await,
-            "duckduckgo" => self.html_backend(duckduckgo_url(q)?, false, "DuckDuckGo", n).await,
-            "duckduckgo_lite" => {
-                let url = reqwest::Url::parse_with_params("https://lite.duckduckgo.com/lite/", &[("q", q)]).map_err(|e| e.to_string())?;
-                self.html_backend(url, true, "DuckDuckGo lite", n).await
-            }
+            "duckduckgo" => self.ddg_search(q, n).await,
+            "duckduckgo_lite" => self.ddg_lite_search(q, n).await,
             "brave" => self.brave_search(q, n).await,
             "wikipedia" => self.wikipedia_search(q, n).await,
             other => Err(format!("unknown backend {other}")),
         }
+    }
+
+    async fn ddg_search(&self, q: &str, n: usize) -> Result<Vec<Hit>, String> {
+        let client = Self::client()?;
+        let get_req = client.get(duckduckgo_url(q)?);
+        if let Ok(hits) = self.html_backend(get_req, false, "DuckDuckGo", n).await {
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        let post_req = client
+            .post("https://html.duckduckgo.com/html/")
+            .header(reqwest::header::ORIGIN, "https://html.duckduckgo.com")
+            .header(reqwest::header::REFERER, "https://html.duckduckgo.com/")
+            .form(&[("q", q), ("kp", "-2")]);
+        self.html_backend(post_req, false, "DuckDuckGo", n).await
+    }
+
+    async fn ddg_lite_search(&self, q: &str, n: usize) -> Result<Vec<Hit>, String> {
+        let client = Self::client()?;
+        let url = reqwest::Url::parse_with_params("https://lite.duckduckgo.com/lite/", &[("q", q)])
+            .map_err(|e| e.to_string())?;
+        if let Ok(hits) = self.html_backend(client.get(url), true, "DuckDuckGo lite", n).await {
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        let post_req = client
+            .post("https://lite.duckduckgo.com/lite/")
+            .header(reqwest::header::ORIGIN, "https://lite.duckduckgo.com")
+            .header(reqwest::header::REFERER, "https://lite.duckduckgo.com/")
+            .form(&[("q", q)]);
+        self.html_backend(post_req, true, "DuckDuckGo lite", n).await
     }
 
     async fn searxng_search(&self, q: &str, n: usize) -> Result<Vec<Hit>, String> {
@@ -202,8 +247,8 @@ impl WebTools {
     }
 
     /// A DuckDuckGo HTML results page (the full site or the lite one): read the hits and treat a blocked page as such.
-    async fn html_backend(&self, url: reqwest::Url, lite: bool, name: &str, n: usize) -> Result<Vec<Hit>, String> {
-        let r = Self::client()?.get(url).send().await.map_err(|e| e.to_string())?;
+    async fn html_backend(&self, req: reqwest::RequestBuilder, lite: bool, name: &str, n: usize) -> Result<Vec<Hit>, String> {
+        let r = req.send().await.map_err(|e| e.to_string())?;
         let status = r.status();
         if !status.is_success() {
             return Err(format!("{name} answered {} (it limits automated searches)", status));
@@ -331,6 +376,10 @@ fn duckduckgo_url(q: &str) -> Result<reqwest::Url, String> {
     reqwest::Url::parse_with_params("https://html.duckduckgo.com/html/", &[("q", q), ("kp", "-2")]).map_err(|e| e.to_string())
 }
 
+fn elem_text(e: scraper::ElementRef) -> String {
+    e.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// DuckDuckGo's HTML results: each result's title link (its address in the uddg parameter of DuckDuckGo's redirect)
 /// and excerpt; ads are left out.
 pub fn duckduckgo_hits(html: &str, n: usize) -> Vec<Hit> {
@@ -351,8 +400,7 @@ pub fn duckduckgo_hits(html: &str, n: usize) -> Vec<Hit> {
         if !url.starts_with("http") {
             continue;
         }
-        let text = |e: scraper::ElementRef| e.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-        out.push(Hit { title: text(a), url, snippet: r.select(&snip).next().map(text).unwrap_or_default() });
+        out.push(Hit { title: elem_text(a), url, snippet: r.select(&snip).next().map(elem_text).unwrap_or_default() });
         if out.len() >= n {
             break;
         }
@@ -360,28 +408,37 @@ pub fn duckduckgo_hits(html: &str, n: usize) -> Vec<Hit> {
     out
 }
 
-/// The lite results table: each result's link (class `result-link`) and its excerpt (in `td.result-snippet`); the real
-/// target is the `u` parameter of DuckDuckGo's redirect, when present. Parsed per row so a title pairs with its own
-/// snippet, and rows with no link are skipped.
+/// The lite results table: each result's link (`td.result-link a` or `a.result-link`) and its excerpt (in
+/// `td.result-snippet` on the same row or the following row); the real target is the `u` or `uddg` parameter of
+/// DuckDuckGo's redirect, when present.
 pub fn parse_ddg_lite(html: &str, n: usize) -> Vec<Hit> {
     let doc = scraper::Html::parse_document(html);
     let row = scraper::Selector::parse("tr").unwrap();
-    let link = scraper::Selector::parse("td.result-link a").unwrap();
+    let link = scraper::Selector::parse("td.result-link a, a.result-link").unwrap();
     let snip = scraper::Selector::parse("td.result-snippet").unwrap();
+    let rows: Vec<_> = doc.select(&row).collect();
     let mut out = Vec::new();
-    for r in doc.select(&row) {
-        let Some(a) = r.select(&link).next() else { continue };
+    for i in 0..rows.len() {
+        let Some(a) = rows[i].select(&link).next() else { continue };
         let url = resolve_lite_href(a.value().attr("href").unwrap_or(""));
         if !url.starts_with("http") { continue; }
-        let snippet = r.select(&snip).next().map(|e| e.text().collect::<Vec<_>>().join(" ")).unwrap_or_default();
-        let title = a.text().collect::<Vec<_>>().join(" ");
-        out.push(Hit { title, url, snippet });
+        let mut snippet = rows[i].select(&snip).next().map(elem_text).unwrap_or_default();
+        if snippet.is_empty() {
+            for r in rows.iter().skip(i + 1).take(3) {
+                if r.select(&link).next().is_some() { break; }
+                if let Some(s) = r.select(&snip).next() {
+                    snippet = elem_text(s);
+                    break;
+                }
+            }
+        }
+        out.push(Hit { title: elem_text(a), url, snippet });
         if out.len() >= n { break; }
     }
     out
 }
 
-/// A lite result's address is either a direct link or DuckDuckGo's `/v/` redirect whose real target is the `u` param.
+/// A lite result's address is either a direct link or DuckDuckGo's `/v/` or `/l/` redirect whose real target is `u` or `uddg`.
 fn resolve_lite_href(href: &str) -> String {
     let full = if href.starts_with("//") { format!("https:{href}") } else if href.starts_with('/') {
         format!("https://lite.duckduckgo.com{href}")
@@ -389,7 +446,7 @@ fn resolve_lite_href(href: &str) -> String {
         href.to_string()
     };
     if let Ok(u) = reqwest::Url::parse(&full) {
-        if let Some((_, target)) = u.query_pairs().find(|(k, _)| k == "u") { return target.into_owned(); }
+        if let Some((_, target)) = u.query_pairs().find(|(k, _)| k == "u" || k == "uddg") { return target.into_owned(); }
     }
     full
 }
@@ -658,5 +715,19 @@ mod tests {
         let (title, text) = page_text(html);
         assert_eq!(title, "The Title");
         assert_eq!(text, "# Heading\nFirst paragraph with a link.\n- one\n- two");
+    }
+
+    #[test]
+    fn duckduckgo_lite_two_row_uddg_hits_are_parsed() {
+        let html = r#"<html><body><table>
+            <tr><td>1.&nbsp;</td><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F&amp;rut=abc" class="result-link">Rust <b>Programming</b> Language</a></td></tr>
+            <tr><td>&nbsp;</td><td class="result-snippet">  <b>Rust</b> is fast and reliable.  </td></tr>
+            </table></body></html>"#;
+        let hits = parse_ddg_lite(html, 8);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            (hits[0].title.as_str(), hits[0].url.as_str(), hits[0].snippet.as_str()),
+            ("Rust Programming Language", "https://rust-lang.org/", "Rust is fast and reliable.")
+        );
     }
 }

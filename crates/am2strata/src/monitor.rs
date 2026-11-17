@@ -477,7 +477,8 @@ impl Monitor {
             let m = |k: &str| g[k].as_f64().map(|v| (v / 1048576.0).round());
             json!({"index": g["index"], "name": g["name"], "util_pct": g["util"], "memory_used_mib": m("mem_used"), "memory_total_mib": m("mem_total"),
                    "temperature_c": g["temp"], "power_w": g["power"], "power_limit_w": g["power_limit"],
-                   "pcie": {"gen": g["pcie_gen"], "gen_max": g["pcie_gen_max"], "width": g["pcie_width"]}})
+                   "pcie": {"gen": g["pcie_gen"], "gen_max": g["pcie_gen_max"], "width": g["pcie_width"],
+                            "rx_mb_s": g["pcie_rx_mb"], "tx_mb_s": g["pcie_tx_mb"]}})
         }).collect();
         json!({"alerts": self.alerts(), "gpus": gpus, "gpu_driver": tel.stat.get("gpu_driver"), "gpu_note": tel.stat.get("gpu_note"),
                "cpu": {"name": tel.stat.get("cpu_name"), "cores": tel.stat.get("cores"), "threads": tel.stat.get("threads"), "util_pct": tel.now.get("cpu")},
@@ -631,14 +632,173 @@ impl Drop for Record {
     }
 }
 
-/// The hardware sampler: nvidia-smi in its own loop mode (one process, a line per GPU a second), /proc for the CPU,
-/// RAM and disks. Missing tools leave their fields out, as PolyStrata's telemetry does.
+#[cfg(windows)]
+pub(crate) fn win_cpu_name() -> Option<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            lpsubkey: *const u16,
+            lpvalue: *const u16,
+            dwflags: u32,
+            pdwtype: *mut u32,
+            pvdata: *mut core::ffi::c_void,
+            pcbdata: *mut u32,
+        ) -> i32;
+    }
+    const HKEY_LOCAL_MACHINE: isize = (0x80000002_u32 as i32) as isize;
+    const RRF_RT_REG_SZ: u32 = 0x00000002;
+    let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\0".encode_utf16().collect();
+    let val_name: Vec<u16> = "ProcessorNameString\0".encode_utf16().collect();
+    let mut size: u32 = 0;
+    let err = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), val_name.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
+    if err != 0 || size < 2 {
+        return None;
+    }
+    let mut buf = vec![0u16; (size as usize / 2) + 2];
+    let mut bytes = (buf.len() * 2) as u32;
+    let err = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), val_name.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut bytes) };
+    if err != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let name = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(windows)]
+pub(crate) fn win_physical_cores() -> Option<usize> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalProcessorInformationEx(rel_type: u32, buf: *mut u8, len: *mut u32) -> i32;
+    }
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    let mut len: u32 = 0;
+    unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    let ok = unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return None;
+    }
+    let mut offset = 0usize;
+    let mut count = 0usize;
+    while offset + 8 <= len as usize {
+        let entry_size = u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
+        if entry_size == 0 {
+            break;
+        }
+        count += 1;
+        offset += entry_size;
+    }
+    (count > 0).then_some(count)
+}
+
+/// The hardware sampler: nvidia-smi in its own loop mode (one process, a line per GPU a second), /proc on Linux
+/// and Win32 / PDH on Windows for CPU, RAM, PCIe throughput, and disks.
 mod sampler {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     const GPU_FIELDS: &str = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,\
                               pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current";
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn std_cmd_no_win(mut cmd: std::process::Command) -> std::process::Command {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd
+    }
+
+    fn tokio_cmd_no_win(mut cmd: tokio::process::Command) -> tokio::process::Command {
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+
+    #[cfg(windows)]
+    struct WinDiskPdh {
+        query: isize,
+        read_counter: isize,
+        write_counter: isize,
+    }
+
+    #[cfg(windows)]
+    unsafe impl Send for WinDiskPdh {}
+
+    #[cfg(windows)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct PdhFmtCountervalue {
+        c_status: u32,
+        _pad: u32,
+        double_value: f64,
+    }
+
+    #[cfg(windows)]
+    #[link(name = "pdh")]
+    extern "system" {
+        fn PdhOpenQueryW(datasrc: *const u16, userdata: usize, phquery: *mut isize) -> i32;
+        fn PdhAddEnglishCounterW(query: isize, fullcounterpath: *const u16, userdata: usize, phcounter: *mut isize) -> i32;
+        fn PdhCollectQueryData(query: isize) -> i32;
+        fn PdhGetFormattedCounterValue(counter: isize, format: u32, countertype: *mut u32, value: *mut PdhFmtCountervalue) -> i32;
+        fn PdhCloseQuery(query: isize) -> i32;
+    }
+
+    #[cfg(windows)]
+    impl WinDiskPdh {
+        fn new() -> Option<Self> {
+            let mut query: isize = 0;
+            if unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } != 0 {
+                return None;
+            }
+            let r_path: Vec<u16> = "\\PhysicalDisk(_Total)\\Disk Read Bytes/sec\0".encode_utf16().collect();
+            let w_path: Vec<u16> = "\\PhysicalDisk(_Total)\\Disk Write Bytes/sec\0".encode_utf16().collect();
+            let (mut read_counter, mut write_counter): (isize, isize) = (0, 0);
+            let r_ok = unsafe { PdhAddEnglishCounterW(query, r_path.as_ptr(), 0, &mut read_counter) } == 0;
+            let w_ok = unsafe { PdhAddEnglishCounterW(query, w_path.as_ptr(), 0, &mut write_counter) } == 0;
+            if !r_ok || !w_ok {
+                unsafe { let _ = PdhCloseQuery(query); }
+                return None;
+            }
+            unsafe { let _ = PdhCollectQueryData(query); }
+            Some(Self { query, read_counter, write_counter })
+        }
+
+        fn sample_mb(&self) -> Option<(f64, f64)> {
+            const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+            if unsafe { PdhCollectQueryData(self.query) } != 0 {
+                return None;
+            }
+            let read_val = Self::read_double(self.read_counter, PDH_FMT_DOUBLE);
+            let write_val = Self::read_double(self.write_counter, PDH_FMT_DOUBLE);
+            let to_mb = |b: f64| ((b / 1_048_576.0) * 100.0).round() / 100.0;
+            Some((to_mb(read_val), to_mb(write_val)))
+        }
+
+        fn read_double(counter: isize, fmt: u32) -> f64 {
+            let mut val = PdhFmtCountervalue::default();
+            let status = unsafe { PdhGetFormattedCounterValue(counter, fmt, std::ptr::null_mut(), &mut val) };
+            if status == 0 && val.double_value.is_finite() && val.double_value >= 0.0 {
+                val.double_value
+            } else {
+                0.0
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WinDiskPdh {
+        fn drop(&mut self) {
+            unsafe { let _ = PdhCloseQuery(self.query); }
+        }
+    }
 
     /// NVIDIA display cards on the PCI bus, as `0000:08:00.0`.
     fn cards_on_bus() -> Vec<String> {
@@ -655,10 +815,14 @@ mod sampler {
 
     /// What the health watch reports now: cards the driver cannot reach, and new driver errors since `since`.
     pub(super) fn check(since: &str) -> (Vec<String>, u64, Vec<String>) {
-        let reach = std::process::Command::new("nvidia-smi").args(["--query-gpu=pci.bus_id", "--format=csv,noheader"]).output()
+        let mut reach_cmd = std::process::Command::new("nvidia-smi");
+        reach_cmd.args(["--query-gpu=pci.bus_id", "--format=csv,noheader"]);
+        let reach = std_cmd_no_win(reach_cmd).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase()).unwrap_or_default();
         let lost: Vec<String> = cards_on_bus().into_iter().filter(|c| !reach.lines().any(|l| l.trim().ends_with(c.as_str()))).collect();
-        let log = std::process::Command::new("journalctl").args(["-k", "--no-pager", "-q", "--since", since]).output()
+        let mut log_cmd = std::process::Command::new("journalctl");
+        log_cmd.args(["-k", "--no-pager", "-q", "--since", since]);
+        let log = std_cmd_no_win(log_cmd).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         let errors: Vec<String> = log.lines().filter(|l| l.contains("NVRM: Xid") || l.contains("fallen off the bus"))
             .map(|l| l.chars().take(200).collect()).collect();
@@ -691,13 +855,13 @@ mod sampler {
         });
         static_facts(&m);
         let gpus: Arc<Mutex<HashMap<u32, Vec<String>>>> = Arc::default();
-        if let Ok(mut child) = tokio::process::Command::new("nvidia-smi")
-            .args([&format!("--query-gpu={GPU_FIELDS}"), "--format=csv,noheader,nounits", "-lms", "1000"])
+        let pcie: Arc<Mutex<HashMap<u32, (f64, f64)>>> = Arc::default();
+        let mut qcmd = tokio::process::Command::new("nvidia-smi");
+        qcmd.args([&format!("--query-gpu={GPU_FIELDS}"), "--format=csv,noheader,nounits", "-lms", "1000"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        if let Ok(mut child) = tokio_cmd_no_win(qcmd).spawn() {
             let stdout = child.stdout.take();
             let g = gpus.clone();
             tokio::spawn(async move {
@@ -712,13 +876,40 @@ mod sampler {
                 }
             });
         }
+        let mut dcmd = tokio::process::Command::new("nvidia-smi");
+        dcmd.args(["dmon", "-s", "t", "-d", "1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        if let Ok(mut child) = tokio_cmd_no_win(dcmd).spawn() {
+            let stdout = child.stdout.take();
+            let p = pcie.clone();
+            tokio::spawn(async move {
+                let _child = child;
+                let Some(out) = stdout else { return };
+                let mut lines = BufReader::new(out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with('#') {
+                        continue;
+                    }
+                    let mut parts = t.split_whitespace();
+                    let Some(idx) = parts.next().and_then(|x| x.parse::<u32>().ok()) else { continue };
+                    let rx = parts.next().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                    let tx = parts.next().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                    p.lock().unwrap().insert(idx, (rx, tx));
+                }
+            });
+        }
         tokio::spawn(async move {
+            #[cfg(windows)]
+            let disk_pdh = WinDiskPdh::new();
             let mut cpu_prev = cpu_times();
             let mut disk_prev = (now(), disk_sectors());
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let mut s = serde_json::Map::new();
-                gpu_fields(&gpus.lock().unwrap(), &mut s);
+                gpu_fields(&gpus.lock().unwrap(), &pcie.lock().unwrap(), &mut s);
                 let cpu = cpu_times();
                 if let (Some((b0, i0)), Some((b1, i1))) = (cpu_prev, cpu) {
                     let (db, di) = (b1.saturating_sub(b0) as f64, i1.saturating_sub(i0) as f64);
@@ -730,6 +921,11 @@ mod sampler {
                 if let Some((used, total)) = ram() {
                     s.insert("ram_used".into(), json!(used));
                     s.insert("ram_total".into(), json!(total));
+                }
+                #[cfg(windows)]
+                if let Some((r_mb, w_mb)) = disk_pdh.as_ref().and_then(|d| d.sample_mb()) {
+                    s.insert("disk_read_mb".into(), json!(r_mb));
+                    s.insert("disk_write_mb".into(), json!(w_mb));
                 }
                 let disk = (now(), disk_sectors());
                 if let (Some((r0, w0)), Some((r1, w1))) = (disk_prev.1, disk.1) {
@@ -761,41 +957,56 @@ mod sampler {
         f.get(i).and_then(|x| x.parse::<f64>().ok())
     }
 
-    fn gpu_fields(gpus: &HashMap<u32, Vec<String>>, s: &mut serde_json::Map<String, Value>) {
+    fn gpu_fields(gpus: &HashMap<u32, Vec<String>>, pcie: &HashMap<u32, (f64, f64)>, s: &mut serde_json::Map<String, Value>) {
         if gpus.is_empty() {
             return;
         }
-        let mut idx: Vec<&u32> = gpus.keys().collect();
+        let mut idx: Vec<u32> = gpus.keys().copied().collect();
         idx.sort();
-        let rows: Vec<&Vec<String>> = idx.iter().map(|i| &gpus[i]).collect();
+        let rows: Vec<(u32, &Vec<String>)> = idx.iter().map(|i| (*i, &gpus[i])).collect();
         let mib = |v: Option<f64>| v.map(|x| x * 1048576.0);
         let sum = |i: usize| -> Option<f64> {
-            let v: Vec<f64> = rows.iter().filter_map(|r| num(r, i)).collect();
+            let v: Vec<f64> = rows.iter().filter_map(|(_, r)| num(r, i)).collect();
             (!v.is_empty()).then(|| v.iter().sum())
         };
-        let utils: Vec<f64> = rows.iter().filter_map(|r| num(r, 2)).collect();
-        let temps: Vec<f64> = rows.iter().filter_map(|r| num(r, 5)).collect();
+        let utils: Vec<f64> = rows.iter().filter_map(|(_, r)| num(r, 2)).collect();
+        let temps: Vec<f64> = rows.iter().filter_map(|(_, r)| num(r, 5)).collect();
         s.insert("gpu_util".into(), json!((!utils.is_empty()).then(|| utils.iter().sum::<f64>() / utils.len() as f64)));
         s.insert("gpu_mem_used".into(), json!(mib(sum(3))));
         s.insert("gpu_mem_total".into(), json!(mib(sum(4))));
         s.insert("gpu_temp".into(), json!(temps.iter().cloned().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))))));
         s.insert("gpu_power".into(), json!(sum(6)));
         s.insert("gpu_power_limit".into(), json!(sum(7)));
-        s.insert("gpu_pcie_gen".into(), json!(num(rows[0], 8)));
-        s.insert("gpu_pcie_gen_max".into(), json!(num(rows[0], 9)));
-        s.insert("gpu_pcie_width".into(), json!(num(rows[0], 10)));
+        s.insert("gpu_pcie_gen".into(), json!(num(rows[0].1, 8)));
+        s.insert("gpu_pcie_gen_max".into(), json!(num(rows[0].1, 9)));
+        s.insert("gpu_pcie_width".into(), json!(num(rows[0].1, 10)));
+        if !pcie.is_empty() {
+            let rx_vals: Vec<f64> = rows.iter().filter_map(|(i, _)| pcie.get(i).map(|x| x.0)).collect();
+            let tx_vals: Vec<f64> = rows.iter().filter_map(|(i, _)| pcie.get(i).map(|x| x.1)).collect();
+            if !rx_vals.is_empty() {
+                s.insert("gpu_pcie_rx_mb".into(), json!(rx_vals.iter().sum::<f64>()));
+            }
+            if !tx_vals.is_empty() {
+                s.insert("gpu_pcie_tx_mb".into(), json!(tx_vals.iter().sum::<f64>()));
+            }
+        }
         let per: Vec<Value> = rows
             .iter()
-            .map(|r| json!({"index": num(r, 0), "name": r.get(1), "util": num(r, 2), "mem_used": mib(num(r, 3)), "mem_total": mib(num(r, 4)),
-                            "temp": num(r, 5), "power": num(r, 6), "power_limit": num(r, 7), "pcie_gen": num(r, 8), "pcie_gen_max": num(r, 9),
-                            "pcie_width": num(r, 10)}))
+            .map(|(i, r)| {
+                let (rx, tx) = pcie.get(i).map(|x| (Some(x.0), Some(x.1))).unwrap_or((None, None));
+                json!({"index": num(r, 0), "name": r.get(1), "util": num(r, 2), "mem_used": mib(num(r, 3)), "mem_total": mib(num(r, 4)),
+                       "temp": num(r, 5), "power": num(r, 6), "power_limit": num(r, 7), "pcie_gen": num(r, 8), "pcie_gen_max": num(r, 9),
+                       "pcie_width": num(r, 10), "pcie_rx_mb": rx, "pcie_tx_mb": tx})
+            })
             .collect();
         s.insert("gpus".into(), json!(per));
     }
 
     fn static_facts(m: &Monitor) {
         let mut st = serde_json::Map::new();
-        if let Ok(o) = std::process::Command::new("nvidia-smi").args(["--query-gpu=name,driver_version", "--format=csv,noheader"]).output() {
+        let mut ncmd = std::process::Command::new("nvidia-smi");
+        ncmd.args(["--query-gpu=name,driver_version", "--format=csv,noheader"]);
+        if let Ok(o) = std_cmd_no_win(ncmd).output() {
             let text = String::from_utf8_lossy(&o.stdout);
             if let Some(first) = text.lines().next().filter(|l| !l.is_empty()) {
                 let mut f = first.split(',').map(str::trim);
@@ -818,16 +1029,53 @@ mod sampler {
         if !cores.is_empty() {
             st.insert("cores".into(), json!(cores.len()));
         }
+        #[cfg(windows)]
+        {
+            if !st.contains_key("cpu_name") {
+                if let Some(name) = win_cpu_name() {
+                    st.insert("cpu_name".into(), json!(name));
+                }
+            }
+            if !st.contains_key("cores") {
+                if let Some(c) = win_physical_cores() {
+                    st.insert("cores".into(), json!(c));
+                }
+            }
+        }
         st.insert("psutil".into(), json!(true)); // the web app's "needs psutil" hint does not apply
         m.tel.lock().unwrap().stat = st;
     }
 
-    /// (busy, idle) jiffies of all CPUs.
+    /// (busy, idle) ticks of all CPUs.
     fn cpu_times() -> Option<(u64, u64)> {
-        let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        let v: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
-        let idle = v.get(3)? + v.get(4).unwrap_or(&0);
-        Some((v.iter().take(8).sum::<u64>() - idle, idle))
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            #[derive(Default, Copy, Clone)]
+            struct FileTime {
+                low: u32,
+                high: u32,
+            }
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+            }
+            let (mut idle, mut kernel, mut user) = (FileTime::default(), FileTime::default(), FileTime::default());
+            if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+                return None;
+            }
+            let to_u64 = |ft: FileTime| ((ft.high as u64) << 32) | (ft.low as u64);
+            let i = to_u64(idle);
+            let total = to_u64(kernel).saturating_add(to_u64(user));
+            return Some((total.saturating_sub(i), i));
+        }
+        #[cfg(not(windows))]
+        {
+            let stat = std::fs::read_to_string("/proc/stat").ok()?;
+            let v: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+            let idle = v.get(3)? + v.get(4).unwrap_or(&0);
+            Some((v.iter().take(8).sum::<u64>() - idle, idle))
+        }
     }
 
     /// (used, total) bytes of RAM, as psutil counts them (total - available). From mem.rs on every OS.

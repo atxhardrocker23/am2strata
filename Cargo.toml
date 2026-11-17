@@ -64,8 +64,8 @@ memmap2 = "0.9"
 prost = "0.13"
 
 [profile.release]
-# the server is ~1% of request time (the engine is the rest): fast builds matter more than the last few percent
-lto = false
+# Enable thin LTO alongside native target-cpu for release binaries
+lto = "thin"
 codegen-units = 16
 incremental = true
 

@@ -64,12 +64,14 @@ pub async fn fetch_public(src: &str, allow_private: bool) -> Result<reqwest::Res
             bail!("the URL points into a private network or this PC ({host}); such URLs are not fetched (\"allow_private_urls\" in the run config)");
         }
         let resp = reqwest::Client::builder()
-            .user_agent("strata")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
             .timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&host, addr)
             .build()?
             .get(url.clone())
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .send()
             .await
             .map_err(|e| anyhow!("the URL could not be read: {e}"))?;

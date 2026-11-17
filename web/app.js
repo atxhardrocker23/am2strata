@@ -258,8 +258,8 @@ async function loadHealth() {
                                           : "Attach a text file or a PDF (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
-    if (health.image_generation && !media.models.length) loadMediaModels();
-    else if (!health.image_generation) pickerNote("Media generation is not built on this server");
+    if (!media.models.length) loadMediaModels();
+    if (!health.image_generation) pickerNote("Media generation is not built on this server");
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -374,7 +374,8 @@ async function loadMediaModels() {
   fillModelPickers();
   if (media.audio_device) $("audio-device").value = media.audio_device;
   const sttReady = (media.models || []).some((m) => m.kind === "audio" && m.task === "stt" && m.downloaded);
-  $("mic-btn").hidden = !sttReady;
+  $("mic-btn").hidden = false;
+  if (!sttReady) $("mic-btn").title = "Speak your message (download Whisper in Settings > Images & Audio if needed)";
   clearTimeout(mmTimer);
   if (media.pull && media.pull.state === "pulling") mmTimer = setTimeout(pullTick, 1000);
 }
@@ -1644,7 +1645,7 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false, browser: false};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: true, browser: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;

@@ -541,6 +541,11 @@ fn spawn_kept(mut cmd: std::process::Command) -> std::io::Result<std::process::C
             Ok(())
         });
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     tx.lock().unwrap().send((cmd, back)).map_err(|_| std::io::Error::other("the browser's keeper thread is gone"))?;
     got.recv().map_err(|_| std::io::Error::other("the browser's keeper thread is gone"))?
 }
@@ -736,8 +741,13 @@ impl Browsers {
         } else {
             std::process::Command::new(&exe)
         };
-        cmd.arg("--headless").arg("--remote-debugging-port=0").arg(format!("--user-data-dir={}", profile.display()))
+        cmd.arg("--headless=new")
+            .arg("--remote-debugging-port=0")
+            .arg(format!("--user-data-dir={}", profile.display()))
             .arg(format!("--window-size={WIDTH},{HEIGHT}"))
+            .arg("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+            .arg("--disable-blink-features=AutomationControlled")
+            .arg("--lang=en-US")
             .args(["--no-first-run", "--disable-extensions", "--disable-sync", "--disable-background-networking",
                    "--disable-default-apps", "--mute-audio", "--hide-scrollbars", "--disable-features=Translate", "about:blank"])
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -807,6 +817,20 @@ impl Browsers {
         // (a video sent to YouTube Studio stayed at 0%): a tab the user had open is theirs, with their own logins, so it
         // is left unfiltered as their browser would be; tabs this server opens keep the filter
         if !adopted {
+            if let Ok(ua) = chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+                .accept_language("en-US,en;q=0.9")
+                .platform("Win32")
+                .build()
+            {
+                let _ = page.execute(ua).await;
+            }
+            if let Ok(script) = chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::builder()
+                .source("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                .build()
+            {
+                let _ = page.execute(script).await;
+            }
             // every request the page makes: allowed only to public addresses (and data:, blob:, about:) and not on the lists
             let mut paused = page.event_listener::<fetch::EventRequestPaused>().await.map_err(|e| e.to_string())?;
             page.execute(fetch::EnableParams::default()).await.map_err(|e| e.to_string())?;
