@@ -129,6 +129,13 @@ impl Loaded {
     pub fn config_effort(&self) -> Option<String> {
         self.entry.cfg.rest.get("reasoning_effort").and_then(serde_json::Value::as_str).map(str::to_owned)
     }
+
+    /// Live physical RAM (GiB) currently held by this model's engine and image encoder processes.
+    pub fn live_rss_gb(&self) -> f64 {
+        let eng = self.engine.pid().map(crate::mem::process_rss_gb).unwrap_or(0.0);
+        let vis = self.vision.as_ref().and_then(|v| v.pid()).map(crate::mem::process_rss_gb).unwrap_or(0.0);
+        eng + vis
+    }
 }
 
 pub struct Manager {
@@ -373,10 +380,30 @@ impl Manager {
         }
     }
 
+    /// Whether `entry`'s engine dynamically sizes its resident RAM pool to available RAM at startup
+    /// (`strata --resident-experts` / `--resident-cpu-experts` without a fixed `--expert-ram-gib` cap).
+    fn adaptive_ram(entry: &ModelEntry) -> bool {
+        let has_resident = entry.cfg.args.iter().any(|a| a == "--resident-experts" || a == "--resident-cpu-experts");
+        let has_fixed_cap = entry.cfg.args.iter().any(|a| a == "--expert-ram-gib");
+        has_resident && !has_fixed_cap
+    }
+
+    /// Minimum free RAM (GiB) required before starting `entry`. Adaptive resident-expert engines size their own
+    /// pool to `available - 4 GiB` (falling back to mmap when tight), so their high-water startup delta is capped
+    /// at a 4 GiB floor rather than treated as a hard minimum.
+    fn effective_need(&self, entry: &ModelEntry) -> Option<f64> {
+        let need = self.needs.get(&entry.id)?;
+        if Self::adaptive_ram(entry) {
+            Some(need.min(4.0))
+        } else {
+            Some(need)
+        }
+    }
+
     /// Start `entry`'s engine when this PC has the memory it took last time (waiting a little for memory a model
     /// just stopped is still giving back), and note what it takes now. Short of memory: a plain error, no load.
     async fn start_checked(&self, entry: &ModelEntry) -> Result<Loaded> {
-        if let Some(need) = self.needs.get(&entry.id) {
+        if let Some(need) = self.effective_need(entry) {
             if let Err(free) = crate::mem::wait_for(need, crate::mem::LOAD_WAIT).await {
                 let msg = format!("not enough free memory to load {}: it needs about {need:.0} GB, {free:.1} GB is free \
                                    (with {:.0} GB kept for the system). Close other programs, wait for a media job to end, \
@@ -616,8 +643,11 @@ impl Manager {
             }
         }
         // a model that cannot fit even with the one in memory stopped is refused before that one is stopped
-        if let Some(need) = self.needs.get(&entry.id) {
-            let freed = match self.current().await { Some(l) => self.needs.get(&l.entry.id).unwrap_or(0.0), None => 0.0 };
+        if let Some(need) = self.effective_need(&entry) {
+            let freed = match self.current().await {
+                Some(l) => self.needs.get(&l.entry.id).unwrap_or(0.0).max(l.live_rss_gb()),
+                None => 0.0,
+            };
             let free = crate::mem::available_gb();
             if free > 0.0 && free + freed < need + crate::mem::MARGIN_GB {
                 self.monitor.notice(&format!("{} was not loaded: not enough free memory", entry.id));
@@ -630,8 +660,18 @@ impl Manager {
         let before = self.current.write().await.take();
         let before_id = before.as_ref().map(|l| l.entry.id.clone());
         if let Some(l) = before {
+            let free_before_stop = crate::mem::available_gb();
+            let prev_rss = l.live_rss_gb();
             self.snapshots.save(&l, "before the model stops").await;
             stop(&l).await;
+            if prev_rss >= 1.0 && free_before_stop > 0.0 && std::env::var("AM2_TEST_MEM_GB").is_err() {
+                let target = (free_before_stop + prev_rss * 0.75)
+                    .min((crate::mem::total_gb() - crate::mem::MARGIN_GB).max(0.0));
+                let t_reclaim = std::time::Instant::now();
+                while t_reclaim.elapsed() < Duration::from_secs(5) && crate::mem::available_gb() < target {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
         }
         match self.start_checked(&entry).await {
             Ok(l) => {
@@ -778,34 +818,66 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         think_open_ids = tok.encode("<think>", true).unwrap_or_default();
     }
     let family = cfg.family();
-    // the image encoder first: the engine sizes its expert cache to the VRAM it finds free, so an encoder started
-    // after it finds none (PolyStrata starts them in this order too)
-    let vision = match &cfg.vision {
-        Some(v) => {
-            let env = child_env(&cfg);
-            match Vision::start(v, vision_gpu, &env, cfg.log.as_deref()).await {
-                Ok(vis) => Some(vis),
-                Err(e) => {
-                    tracing::warn!(model = %entry.id, "image encoder did not start ({e}); images are off for this model");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
     let stuck = strata_engine::end_leftover_engines(&cfg.exe, Duration::from_secs(120)).await;
     if !stuck.is_empty() {
         tracing::warn!("the engine from an earlier run (process {stuck:?}) was told to stop but still holds its memory after 120 s; \
                         starting beside it can leave this PC short of RAM");
     }
-    tracing::info!(model = %entry.id, family = ?family, "starting the engine");
-    let engine = match Engine::start(&cfg, ready_timeout).await {
-        Ok(e) => e,
-        Err(e) => {
-            if let Some(v) = &vision {
-                v.shutdown().await;
-            }
-            return Err(anyhow::Error::new(e).context(format!("engine of {}", entry.id)));
+    // When the image encoder runs on the CPU (vision_gpu == false), it sets CUDA_VISIBLE_DEVICES=-1 and uses
+    // zero VRAM, so start it concurrently with the engine to hide its 5-17 s load time. When vision_gpu == true,
+    // start the encoder first so the engine sizes its expert cache around the remaining free VRAM.
+    let (vision, engine) = match (&cfg.vision, vision_gpu) {
+        (Some(v), false) => {
+            let env = child_env(&cfg);
+            tracing::info!(model = %entry.id, family = ?family, "starting the engine and CPU image encoder concurrently");
+            let (vis_res, eng_res) = tokio::join!(
+                Vision::start(v, false, &env, cfg.log.as_deref()),
+                Engine::start(&cfg, ready_timeout)
+            );
+            let vision = match vis_res {
+                Ok(vis) => Some(vis),
+                Err(e) => {
+                    tracing::warn!(model = %entry.id, "image encoder did not start ({e}); images are off for this model");
+                    None
+                }
+            };
+            let engine = match eng_res {
+                Ok(e) => e,
+                Err(e) => {
+                    if let Some(vis) = &vision {
+                        vis.shutdown().await;
+                    }
+                    return Err(anyhow::Error::new(e).context(format!("engine of {}", entry.id)));
+                }
+            };
+            (vision, engine)
+        }
+        (Some(v), true) => {
+            let env = child_env(&cfg);
+            let vision = match Vision::start(v, true, &env, cfg.log.as_deref()).await {
+                Ok(vis) => Some(vis),
+                Err(e) => {
+                    tracing::warn!(model = %entry.id, "image encoder did not start ({e}); images are off for this model");
+                    None
+                }
+            };
+            tracing::info!(model = %entry.id, family = ?family, "starting the engine");
+            let engine = match Engine::start(&cfg, ready_timeout).await {
+                Ok(e) => e,
+                Err(e) => {
+                    if let Some(vis) = &vision {
+                        vis.shutdown().await;
+                    }
+                    return Err(anyhow::Error::new(e).context(format!("engine of {}", entry.id)));
+                }
+            };
+            (vision, engine)
+        }
+        (None, _) => {
+            tracing::info!(model = %entry.id, family = ?family, "starting the engine");
+            let engine = Engine::start(&cfg, ready_timeout).await
+                .map_err(|e| anyhow::Error::new(e).context(format!("engine of {}", entry.id)))?;
+            (None, engine)
         }
     };
     let sampling_defaults = crate::settings::config_sampling(&cfg.rest).map_err(anyhow::Error::msg)?;
@@ -872,7 +944,27 @@ fn ensure_tokenizer(cfg: &strata_engine::RunConfig) -> Result<()> {
 #[cfg(test)]
 mod split_tests {
     use super::layer_split_value as v;
+    use super::{Manager, ModelEntry};
     use serde_json::json;
+
+    fn dummy_entry(args: &[&str]) -> ModelEntry {
+        let cfg: strata_engine::RunConfig = serde_json::from_value(json!({
+            "exe": "strata",
+            "args": args,
+            "tokenizer": ".",
+            "model_name": "test"
+        }))
+        .unwrap();
+        ModelEntry { id: "test".into(), path: std::path::PathBuf::from("strata-test.json"), cfg }
+    }
+
+    #[test]
+    fn adaptive_ram_detection() {
+        assert!(Manager::adaptive_ram(&dummy_entry(&["--resident-experts", "--adapt-async", "1"])));
+        assert!(!Manager::adaptive_ram(&dummy_entry(&["--resident-experts", "--expert-ram-gib", "12"])));
+        assert!(!Manager::adaptive_ram(&dummy_entry(&["--mmap-experts"])));
+        assert!(!Manager::adaptive_ram(&dummy_entry(&["--model", "x.gguf", "--lock-experts"])));
+    }
 
     #[test]
     fn layer_split_values() {

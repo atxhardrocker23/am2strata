@@ -63,6 +63,26 @@ fn read_ids(p: &Path) -> Option<Vec<u32>> {
     Some(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
+#[cfg(windows)]
+fn free_disk(p: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+    let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut avail = 0u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(avail)
+}
+
+#[cfg(not(windows))]
 fn free_disk(p: &Path) -> Option<u64> {
     let out = std::process::Command::new("df").arg("-B1").arg("--output=avail").arg(p).output().ok()?;
     String::from_utf8_lossy(&out.stdout).lines().nth(1)?.trim().parse().ok()

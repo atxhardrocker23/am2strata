@@ -140,13 +140,26 @@ pub fn child_env(cfg: &RunConfig) -> Vec<(String, String)> {
     }
     let dirs: Vec<String> = cfg.lib_dirs.iter().filter(|d| d.is_dir()).map(|d| d.display().to_string()).collect();
     if !dirs.is_empty() {
-        let mut path = dirs.join(":");
-        if let Ok(old) = std::env::var("LD_LIBRARY_PATH") {
-            if !old.is_empty() {
-                path = format!("{path}:{old}");
+        #[cfg(windows)]
+        {
+            let mut path = dirs.join(";");
+            if let Ok(old) = std::env::var("PATH") {
+                if !old.is_empty() {
+                    path = format!("{path};{old}");
+                }
             }
+            env.push(("PATH".into(), path));
         }
-        env.push(("LD_LIBRARY_PATH".into(), path));
+        #[cfg(not(windows))]
+        {
+            let mut path = dirs.join(":");
+            if let Ok(old) = std::env::var("LD_LIBRARY_PATH") {
+                if !old.is_empty() {
+                    path = format!("{path}:{old}");
+                }
+            }
+            env.push(("LD_LIBRARY_PATH".into(), path));
+        }
     }
     env
 }
@@ -275,6 +288,7 @@ struct Inner {
 pub struct Engine {
     inner: Arc<Inner>,
     child: Mutex<Child>,
+    pid: Option<u32>,
     /// how long a request may make no token and no progress before the watchdog ends it (findings item 2)
     pub stall_timeout: Duration,
     /// the model/engine that stalled, to name in the watchdog error
@@ -303,6 +317,7 @@ impl Engine {
             }
         }
         let mut child = cmd.spawn().map_err(|e| Error::Spawn { exe: cfg.exe.display().to_string(), source: e })?;
+        let pid = child.id();
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
@@ -337,11 +352,14 @@ impl Engine {
         Ok(Self {
             inner: Arc::new(Inner { broken: Default::default(), stdin: Mutex::new(stdin), events: Mutex::new(rx), turn: Mutex::new(()) }),
             child: Mutex::new(child),
+            pid,
             stall_timeout,
             engine_label,
             info,
         })
     }
+
+    pub fn pid(&self) -> Option<u32> { self.pid }
 
     /// Run one request. Events arrive on the returned channel; dropping the receiver stops the engine (STOP) and
     /// drains it to DONE, so the next request starts clean.

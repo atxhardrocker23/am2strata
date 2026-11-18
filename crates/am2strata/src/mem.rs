@@ -28,6 +28,14 @@ pub fn total_mib() -> u64 { strata_pack::sysmem::total_mib() }
 /// RAM the OS says is free right now (MiB; 0 when it cannot tell).
 pub fn available_mib() -> u64 { strata_pack::sysmem::available_mib() }
 
+/// Physical RAM (WorkingSet / RSS) currently held by process `pid`, in GiB (0 when unknown or in test mem mode).
+pub fn process_rss_gb(pid: u32) -> f64 {
+    if std::env::var("AM2_TEST_MEM_GB").is_ok() {
+        return 0.0;
+    }
+    strata_pack::sysmem::process_rss_mib(pid) as f64 / 1024.0
+}
+
 #[cfg(test)]
 use strata_pack::sysmem::{kb_to_mib, meminfo_kb};
 
@@ -177,6 +185,13 @@ mod tests {
         let avail = available_mib();
         assert!(total > 0, "total_mib() was 0: the memory source is missing on this OS");
         assert!(avail <= total, "available {avail} MiB is more than total {total} MiB");
+    }
+
+    #[test]
+    fn current_process_rss_is_positive() {
+        let total = total_mib();
+        let rss = strata_pack::sysmem::process_rss_mib(std::process::id());
+        assert!(rss > 0 && rss < total, "process_rss_mib() = {rss} MiB (total {total} MiB)");
     }
 
     #[test]

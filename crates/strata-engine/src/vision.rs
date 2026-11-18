@@ -36,6 +36,7 @@ struct Proc {
 
 pub struct Vision {
     proc: Mutex<Option<Proc>>,
+    pid: std::sync::atomic::AtomicU32,
     dir: PathBuf,
     cache: Mutex<VecDeque<(String, PathBuf, usize)>>,
     pub on_gpu: bool,
@@ -43,7 +44,19 @@ pub struct Vision {
 
 /// The encoder's work directory: no space in its path (the ENC line is split at spaces, PolyStrata #480).
 fn work_dir() -> std::io::Result<PathBuf> {
-    let base = std::env::temp_dir();
+    let base = std::env::var_os("STRATA_VISION_TMP")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            if cfg!(windows) {
+                let dev = Path::new(r"G:\Strata-3060");
+                dev.is_dir().then(|| dev.join("cache").join("vision-tmp"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&base);
     for i in 0..1000u32 {
         let d = base.join(format!("strata-vision-rs-{}-{i}", std::process::id()));
         if std::fs::create_dir(&d).is_ok() && !d.display().to_string().contains(' ') {
@@ -85,6 +98,7 @@ impl Vision {
             }
         }
         let mut child = cmd.spawn().map_err(|e| Error::Spawn { exe: cfg.exe.display().to_string(), source: e })?;
+        let pid = child.id().unwrap_or(0);
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         let (tx, mut lines) = mpsc::unbounded_channel();
@@ -105,7 +119,18 @@ impl Vision {
         if !first.starts_with("READY") {
             return Err(Error::Refused(format!("the image encoder did not start: {first}")));
         }
-        Ok(Self { proc: Mutex::new(Some(Proc { child, stdin, lines })), dir, cache: Mutex::new(VecDeque::new()), on_gpu: gpu })
+        Ok(Self {
+            proc: Mutex::new(Some(Proc { child, stdin, lines })),
+            pid: std::sync::atomic::AtomicU32::new(pid),
+            dir,
+            cache: Mutex::new(VecDeque::new()),
+            on_gpu: gpu,
+        })
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        let p = self.pid.load(std::sync::atomic::Ordering::Relaxed);
+        (p != 0).then_some(p)
     }
 
     /// Encode one image (already in a format the encoder reads) -> (embeddings file, image tokens). `keep`: files
@@ -139,6 +164,7 @@ impl Vision {
                 Ok(_) => return Err(Error::Died),
                 Err(_) => {
                     let _ = p.child.start_kill();
+                    self.pid.store(0, std::sync::atomic::Ordering::Relaxed);
                     *guard = None;
                     return Err(Error::Refused("the image encoder said nothing for 600 s".into()));
                 }
@@ -182,6 +208,7 @@ impl Vision {
     }
 
     pub async fn shutdown(&self) {
+        self.pid.store(0, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut p) = self.proc.lock().await.take() {
             let _ = p.child.start_kill();
             let _ = p.child.wait().await;
@@ -190,6 +217,26 @@ impl Vision {
     }
 }
 
+#[cfg(windows)]
+fn free_bytes(p: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+    let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut avail = 0u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(avail)
+}
+
+#[cfg(not(windows))]
 fn free_bytes(p: &Path) -> Option<u64> {
     let out = std::process::Command::new("df").args(["-B1", "--output=avail"]).arg(p).output().ok()?;
     String::from_utf8_lossy(&out.stdout).lines().nth(1)?.trim().parse().ok()

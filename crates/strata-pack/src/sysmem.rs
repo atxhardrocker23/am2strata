@@ -25,6 +25,23 @@ pub fn available_mib() -> u64 {
     { 0 }
 }
 
+/// Physical RAM (WorkingSet / VmRSS) currently held by process `pid`, in MiB (0 when unknown).
+pub fn process_rss_mib(pid: u32) -> u64 {
+    if pid == 0 {
+        return 0;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/status")).ok()
+            .and_then(|t| meminfo_kb(&t, "VmRSS:").map(kb_to_mib))
+            .unwrap_or(0)
+    }
+    #[cfg(windows)]
+    { windows_process_rss_mib(pid) }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    { 0 }
+}
+
 /// /proc/meminfo's number for `key`, in kB (the unit the line reports). Pure: a test can feed any string.
 pub fn meminfo_kb(text: &str, key: &str) -> Option<u64> {
     text.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok()
@@ -81,6 +98,27 @@ fn global_memory() -> Option<(u64, u64)> {
         info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if GlobalMemoryStatusEx(&mut info) == 0 { return None; }
         Some((info.ullTotalPhys, info.ullAvailPhys))
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_rss_mib(pid: u32) -> u64 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return 0;
+        }
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = K32GetProcessMemoryInfo(handle, &mut pmc, pmc.cb);
+        let _ = CloseHandle(handle);
+        if ok == 0 {
+            return 0;
+        }
+        (pmc.WorkingSetSize as u64) / (1024 * 1024)
     }
 }
 

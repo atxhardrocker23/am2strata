@@ -30,12 +30,13 @@ pub fn facts(models_dir: &Path) -> Value {
     let flags = field("flags").unwrap_or_default();
     let has = |f: &str| flags.split_whitespace().any(|x| x == f);
     #[allow(unused_mut)]
-    let mut simd: Vec<&str> = ["avx2", "fma", "avx512f", "avx512_bf16", "avx512_vnni", "amx_tile", "amx_bf16"].into_iter().filter(|f| has(f)).collect();
+    let mut simd: Vec<&str> = ["avx2", "fma", "avx_vnni", "avx512f", "avx512_bf16", "avx512_vnni", "amx_tile", "amx_bf16"].into_iter().filter(|f| has(f)).collect();
     #[cfg(target_arch = "x86_64")]
     if simd.is_empty() {
         for (ok, name) in [
             (std::arch::is_x86_feature_detected!("avx2"), "avx2"),
             (std::arch::is_x86_feature_detected!("fma"), "fma"),
+            (std::arch::is_x86_feature_detected!("avxvnni"), "avx_vnni"),
             (std::arch::is_x86_feature_detected!("avx512f"), "avx512f"),
             (std::arch::is_x86_feature_detected!("avx512bf16"), "avx512_bf16"),
             (std::arch::is_x86_feature_detected!("avx512vnni"), "avx512_vnni"),
